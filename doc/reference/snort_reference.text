@@ -1631,6 +1631,8 @@ Configuration:
     ac_bnfa | ac_full | hyperscan | lowmem }
   * string search_engine.rule_db_dir: directory for reading / writing
     rule group databases
+  * bool search_engine.share_mpse = true: share compiled pattern matchers
+    across identical rule groups to save memory
   * bool search_engine.split_any_any = true: evaluate any-any rules
     separately to save memory
   * int search_engine.queue_limit = 0: maximum number of fast pattern
@@ -12235,6 +12237,8 @@ libraries see the Getting Started section of the manual.
     matches to queue per packet (0 is unlimited) { 0:max32 }
   * string search_engine.rule_db_dir: directory for reading / writing
     rule group databases
+  * bool search_engine.share_mpse = true: share compiled pattern matchers
+    across identical rule groups to save memory
   * dynamic search_engine.search_method = ac_bnfa: set fast pattern
     algorithm - choose available search engine { ac_bnfa | ac_full |
     hyperscan | lowmem }

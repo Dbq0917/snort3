@@ -1574,6 +1574,8 @@ int fpCreateFastPacketDetection(SnortConfig* sc)
     offload_mpse_count = 0;
     fp_only = 0;
 
+    reset_mpse_cache();
+
     MpseManager::start_search_engine(fp->get_search_api());
 
     if ( log_rule_group_details )
@@ -1605,10 +1607,8 @@ int fpCreateFastPacketDetection(SnortConfig* sc)
 
     if ( !sc->test_mode() or sc->mem_check() )
     {
-#ifdef HAVE_HYPERSCAN
         if ( !fp->get_rule_db_dir().empty() )
             mpse_loaded = fp_deserialize(sc, fp->get_rule_db_dir());
-#endif
 
         unsigned c = compile_mpses(sc, can_build_mt(fp));
         unsigned expected = mpse_count + offload_mpse_count;
@@ -1620,10 +1620,8 @@ int fpCreateFastPacketDetection(SnortConfig* sc)
     bool label = fp_print_port_groups(port_tables);
     fp_print_service_groups(sc->spgmmTable, !label);
 
-#ifdef HAVE_HYPERSCAN
     if ( !fp->get_rule_db_dir().empty() )
         mpse_dumped = fp_serialize(sc, fp->get_rule_db_dir());
-#endif
 
     if ( mpse_count )
     {
@@ -1641,6 +1639,7 @@ int fpCreateFastPacketDetection(SnortConfig* sc)
 
     LogCount("truncated patterns", fp->get_num_patterns_truncated());
     LogCount("fast pattern only", fp_only);
+    LogCount("mpse_cache_hits", get_mpse_cache_hits());
     LogCount("mpse_loaded", mpse_loaded);
     LogCount("mpse_dumped", mpse_dumped);
 

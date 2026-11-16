@@ -146,8 +146,12 @@
 
 #include "bnfa_search.h"
 
+#include <cassert>
+#include <cstring>
 #include <list>
+#include <vector>
 
+#include "hash/hashes.h"
 #include "log/log_stats.h"
 #include "log/messages.h"
 #include "utils/util.h"
@@ -211,6 +215,9 @@ static void bnfa_free(void* p, int n, int* m)
 
 #define BNFA_MALLOC(n,memory) static_cast<bnfa_state_t*>(bnfa_alloc(n, &(memory)))
 #define BNFA_FREE(p,n,memory) bnfa_free(p,n,&(memory))
+
+// offset just past the compact sparse-array block for the given state
+static unsigned bnfa_state_end(const bnfa_state_t* trans, unsigned num_states, unsigned state);
 
 /*
 *  Get next state from transition list
@@ -1205,6 +1212,64 @@ bnfa_struct_t* bnfaNew(const MpseAgent* agent)
     return p;
 }
 
+// Release every compiled artifact (match nodes, detection trees and the
+// compact transition array) but keep the registered pattern list so the
+// engine can be restored from cache or recompiled.  Safe to call on an
+// engine that has only had patterns added.
+static void bnfa_release_compiled(bnfa_struct_t* bnfa)
+{
+    if ( !bnfa or !bnfa->bnfaNumStates )
+        return;
+
+    for ( int i = 0; i < bnfa->bnfaNumStates; i++ )
+    {
+        bnfa_match_node_t* mlist = bnfa->bnfaMatchList ? bnfa->bnfaMatchList[i] : nullptr;
+
+        while ( mlist )
+        {
+            bnfa_match_node_t* ilist = mlist;
+            mlist = mlist->next;
+
+            if ( ilist->rule_option_tree && bnfa->agent )
+                bnfa->agent->tree_free(&(ilist->rule_option_tree));
+
+            if ( ilist->neg_list && bnfa->agent )
+                bnfa->agent->list_free(&(ilist->neg_list));
+
+            BNFA_FREE(ilist, sizeof(bnfa_match_node_t), bnfa->matchlist_memory);
+        }
+
+        if ( bnfa->bnfaMatchList )
+            bnfa->bnfaMatchList[i] = nullptr;
+    }
+
+    BNFA_FREE(bnfa->bnfaMatchList,
+        bnfa->bnfaNumStates * sizeof(bnfa_pattern_t*), bnfa->matchlist_memory);
+    bnfa->bnfaMatchList = nullptr;
+
+    BNFA_FREE(bnfa->bnfaFailState,
+        bnfa->bnfaNumStates * sizeof(bnfa_state_t), bnfa->failstate_memory);
+    bnfa->bnfaFailState = nullptr;
+
+    BNFA_FREE(bnfa->bnfaNextState,
+        bnfa->bnfaNumStates * sizeof(bnfa_state_t*), bnfa->nextstate_memory);
+    bnfa->bnfaNextState = nullptr;
+
+    if ( bnfa->bnfaTransList )
+    {
+        unsigned words =
+            bnfa_state_end(bnfa->bnfaTransList, bnfa->bnfaNumStates, bnfa->bnfaNumStates - 1);
+        BNFA_FREE(bnfa->bnfaTransList, words * sizeof(bnfa_state_t), bnfa->nextstate_memory);
+        bnfa->bnfaTransList = nullptr;
+    }
+
+    bnfa->bnfaNumStates = 0;
+    bnfa->bnfaMatchStates = 0;
+    bnfa->bnfaMaxStates = 0;
+    bnfa->bnfaNumTrans = 0;
+    bnfa->bnfaTransTable = nullptr;
+}
+
 /*
 *   Fee all memory
 */
@@ -1212,6 +1277,8 @@ void bnfaFree(bnfa_struct_t* bnfa)
 {
     int i;
     bnfa_pattern_t* patrn;
+
+    bnfa_release_compiled(bnfa);
 
     for (i = 0; i < bnfa->bnfaNumStates; i++)
     {
@@ -1268,8 +1335,15 @@ void bnfaFree(bnfa_struct_t* bnfa)
         bnfa->matchlist_memory);
     BNFA_FREE(bnfa->bnfaNextState,bnfa->bnfaNumStates*sizeof(bnfa_state_t*),
         bnfa->nextstate_memory);
-    BNFA_FREE(bnfa->bnfaTransList,(2*bnfa->bnfaNumStates+bnfa->bnfaNumTrans)*sizeof(bnfa_state_t),
-        bnfa->nextstate_memory);
+    if ( bnfa->bnfaTransList )
+    {
+        // free the exact number of words actually present in the compact
+        // sparse array; the estimate used at compile time does not hold for
+        // databases restored from cache
+        unsigned words =
+            bnfa_state_end(bnfa->bnfaTransList, bnfa->bnfaNumStates, bnfa->bnfaNumStates - 1);
+        BNFA_FREE(bnfa->bnfaTransList, words * sizeof(bnfa_state_t), bnfa->nextstate_memory);
+    }
     snort_free(bnfa);   /* cannot update memory tracker when deleting bnfa so just 'free' it !*/
 }
 
@@ -1454,6 +1528,330 @@ int bnfaCompile(SnortConfig* sc, bnfa_struct_t* bnfa)
         bnfaBuildMatchStateTrees(sc, bnfa);
 
     return 0;
+}
+
+void bnfaBuildMatchTrees(SnortConfig* sc, bnfa_struct_t* bnfa)
+{
+    if ( bnfa and bnfa->agent )
+        bnfaBuildMatchStateTrees(sc, bnfa);
+}
+
+// walk the compact sparse array to find the offset just past state k's block
+static unsigned bnfa_state_end(const bnfa_state_t* trans, unsigned num_states, unsigned state)
+{
+    unsigned idx = 0;
+
+    for ( unsigned k = 0; k < num_states; ++k )
+    {
+        ++idx;  // state id word
+        const bnfa_state_t control = trans[idx++];
+
+        if ( control & BNFA_SPARSE_FULL_BIT )
+            idx += BNFA_MAX_ALPHABET_SIZE;
+        else
+            idx += (control & BNFA_SPARSE_COUNT_BITS) >> BNFA_SPARSE_COUNT_SHIFT;
+
+        if ( k == state )
+            break;
+    }
+    return idx;
+}
+
+namespace
+{
+constexpr uint32_t BNFA_DB_MAGIC = 0x424e4641;  // 'BNFA'
+constexpr uint32_t BNFA_DB_VERSION = 1;
+
+struct BnfaDbHeader
+{
+    uint32_t magic;
+    uint32_t version;
+    uint32_t num_states;
+    uint32_t num_patterns;
+    uint32_t trans_words;
+    uint32_t case_mode;
+    uint32_t alphabet_size;
+    uint32_t flags;
+};
+
+struct BnfaPatternHeader
+{
+    uint32_t len;
+    uint32_t flags;
+};
+
+constexpr uint32_t BNFA_PAT_NOCASE = 1;
+constexpr uint32_t BNFA_PAT_NEGATED = 2;
+
+// bnfa patterns are stored as a linked list, so snapshot them into a stable,
+// indexable order that can be shared by the hash, dump and load paths.
+std::vector<bnfa_pattern_t*> bnfa_pattern_vector(const bnfa_struct_t* bnfa)
+{
+    std::vector<bnfa_pattern_t*> patterns;
+    patterns.reserve(bnfa->bnfaPatternCnt);
+
+    for ( bnfa_pattern_t* p = const_cast<bnfa_pattern_t*>(bnfa->bnfaPatterns); p; p = p->next )
+        patterns.push_back(p);
+
+    return patterns;
+}
+
+int bnfa_pattern_index(const std::vector<bnfa_pattern_t*>& patterns, const bnfa_pattern_t* target)
+{
+    for ( unsigned i = 0; i < patterns.size(); ++i )
+    {
+        if ( patterns[i] == target )
+            return (int)i;
+    }
+    return -1;
+}
+}
+
+void bnfaGetHash(bnfa_struct_t* bnfa, std::string& hash)
+{
+    std::vector<bnfa_pattern_t*> patterns = bnfa_pattern_vector(bnfa);
+    std::string canonical;
+
+    for ( const bnfa_pattern_t* p : patterns )
+    {
+        // length prefix keeps distinct pattern sets from colliding
+        char lenbuf[sizeof(uint32_t)];
+        uint32_t plen = p->n;
+        memcpy(lenbuf, &plen, sizeof(plen));
+        canonical.append(lenbuf, sizeof(lenbuf));
+        canonical.append(reinterpret_cast<const char*>(p->casepatrn), p->n);
+        canonical.push_back(static_cast<char>(p->nocase));
+        canonical.push_back(static_cast<char>(p->negative));
+    }
+
+    uint8_t digest[MD5_HASH_SIZE];
+    md5(reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size(), digest);
+    hash.assign(reinterpret_cast<const char*>(digest), sizeof(digest));
+}
+
+int bnfaSerialize(const bnfa_struct_t* bnfa, uint8_t*& buf, size_t& len)
+{
+    if ( !bnfa or bnfa->bnfaFormat != BNFA_SPARSE or !bnfa->bnfaTransList
+        or !bnfa->bnfaPatternCnt or !bnfa->bnfaNumStates )
+        return 0;
+
+    const std::vector<bnfa_pattern_t*> patterns = bnfa_pattern_vector(bnfa);
+    const unsigned trans_words =
+        bnfa_state_end(bnfa->bnfaTransList, bnfa->bnfaNumStates, bnfa->bnfaNumStates - 1);
+
+    size_t size = sizeof(BnfaDbHeader);
+
+    for ( const bnfa_pattern_t* p : patterns )
+    {
+        size += sizeof(BnfaPatternHeader);
+        size += p->n;
+    }
+
+    // per state: a match count followed by one pattern index per match
+    for ( unsigned state = 0; state < (unsigned)bnfa->bnfaNumStates; ++state )
+    {
+        size += sizeof(uint32_t);
+        for ( bnfa_match_node_t* mn = bnfa->bnfaMatchList[state]; mn; mn = mn->next )
+            size += sizeof(int);
+    }
+    size += trans_words * sizeof(bnfa_state_t);
+
+    // plain calloc so callers release the image with free(), matching the
+    // hyperscan serialize() ownership convention used by the fp cache layer
+    auto* out = static_cast<uint8_t*>(calloc(1, size));
+    if ( !out )
+        return -1;
+
+    uint8_t* cursor = out;
+
+    auto put = [&cursor](const void* data, size_t n)
+    {
+        memcpy(cursor, data, n);
+        cursor += n;
+    };
+
+    BnfaDbHeader header { };
+    header.magic = BNFA_DB_MAGIC;
+    header.version = BNFA_DB_VERSION;
+    header.num_states = bnfa->bnfaNumStates;
+    header.num_patterns = patterns.size();
+    header.trans_words = trans_words;
+    header.case_mode = bnfa->bnfaCaseMode;
+    header.alphabet_size = bnfa->bnfaAlphabetSize;
+    put(&header, sizeof(header));
+
+    for ( const bnfa_pattern_t* p : patterns )
+    {
+        BnfaPatternHeader ph { };
+        ph.len = p->n;
+        ph.flags = (p->nocase ? BNFA_PAT_NOCASE : 0) | (p->negative ? BNFA_PAT_NEGATED : 0);
+        put(&ph, sizeof(ph));
+        put(p->casepatrn, p->n);
+    }
+
+    for ( unsigned state = 0; state < (unsigned)bnfa->bnfaNumStates; ++state )
+    {
+        uint32_t count = 0;
+        for ( bnfa_match_node_t* mn = bnfa->bnfaMatchList[state]; mn; mn = mn->next )
+            ++count;
+        put(&count, sizeof(count));
+
+        for ( bnfa_match_node_t* mn = bnfa->bnfaMatchList[state]; mn; mn = mn->next )
+        {
+            int index = bnfa_pattern_index(patterns, static_cast<bnfa_pattern_t*>(mn->data));
+            put(&index, sizeof(index));
+        }
+    }
+
+    put(bnfa->bnfaTransList, trans_words * sizeof(bnfa_state_t));
+
+    assert(cursor == out + size);
+    buf = out;
+    len = size;
+    return 1;
+}
+
+bool bnfaDeserialize(bnfa_struct_t* bnfa, const uint8_t* buf, size_t len)
+{
+    if ( !bnfa or !buf or len < sizeof(BnfaDbHeader) )
+        return false;
+
+    // drop any previously compiled machine while keeping the pattern list
+    bnfa_release_compiled(bnfa);
+
+    const uint8_t* cursor = buf;
+    const uint8_t* end = buf + len;
+
+    auto get = [&cursor, end](void* data, size_t n) -> bool
+    {
+        if ( cursor + n > end )
+            return false;
+        memcpy(data, cursor, n);
+        cursor += n;
+        return true;
+    };
+
+    BnfaDbHeader header { };
+    if ( !get(&header, sizeof(header))
+        or header.magic != BNFA_DB_MAGIC
+        or header.version != BNFA_DB_VERSION
+        or header.num_states == 0
+        or header.alphabet_size != BNFA_MAX_ALPHABET_SIZE )
+        return false;
+
+    std::vector<bnfa_pattern_t*> patterns = bnfa_pattern_vector(bnfa);
+
+    if ( patterns.size() != header.num_patterns )
+        return false;
+
+    // validate the stored pattern descriptors against the patterns currently
+    // registered on this mpse; a mismatch means the cache is stale.
+    for ( unsigned i = 0; i < header.num_patterns; ++i )
+    {
+        BnfaPatternHeader ph { };
+        if ( !get(&ph, sizeof(ph)) or ph.len != patterns[i]->n )
+            return false;
+
+        if ( cursor + ph.len > end or memcmp(cursor, patterns[i]->casepatrn, ph.len) )
+            return false;
+
+        const uint32_t want =
+            (patterns[i]->nocase ? BNFA_PAT_NOCASE : 0) |
+            (patterns[i]->negative ? BNFA_PAT_NEGATED : 0);
+
+        if ( ph.flags != want )
+            return false;
+
+        cursor += ph.len;
+    }
+
+    bnfa_match_node_t** match_list = static_cast<bnfa_match_node_t**>(
+        snort_calloc(header.num_states * sizeof(bnfa_match_node_t*)));
+    if ( !match_list )
+        return false;
+
+    auto fail_cleanup = [&]()
+    {
+        for ( unsigned state = 0; state < header.num_states; ++state )
+        {
+            bnfa_match_node_t* mn = match_list[state];
+            while ( mn )
+            {
+                bnfa_match_node_t* dead = mn;
+                mn = mn->next;
+                bnfa_free(dead, sizeof(bnfa_match_node_t), &bnfa->matchlist_memory);
+            }
+        }
+        snort_free(match_list);
+    };
+
+    for ( unsigned state = 0; state < header.num_states; ++state )
+    {
+        uint32_t count = 0;
+        if ( !get(&count, sizeof(count)) )
+        {
+            fail_cleanup();
+            return false;
+        }
+
+        // reverse order so the rebuilt chain matches bnfaAddPattern head insertion
+        for ( uint32_t j = 0; j < count; ++j )
+        {
+            int index = 0;
+            if ( !get(&index, sizeof(index))
+                or index < 0 or (unsigned)index >= header.num_patterns )
+            {
+                fail_cleanup();
+                return false;
+            }
+
+            auto* mn = static_cast<bnfa_match_node_t*>(
+                bnfa_alloc(sizeof(bnfa_match_node_t), &bnfa->matchlist_memory));
+            if ( !mn )
+            {
+                fail_cleanup();
+                return false;
+            }
+            mn->data = patterns[index];
+            mn->rule_option_tree = nullptr;
+            mn->neg_list = nullptr;
+            mn->next = match_list[state];
+            match_list[state] = mn;
+        }
+    }
+
+    if ( cursor + header.trans_words * sizeof(bnfa_state_t) != end )
+    {
+        fail_cleanup();
+        return false;
+    }
+
+    auto* trans = static_cast<bnfa_state_t*>(
+        bnfa_alloc(header.trans_words * sizeof(bnfa_state_t), &bnfa->nextstate_memory));
+    if ( !trans )
+    {
+        fail_cleanup();
+        return false;
+    }
+    memcpy(trans, cursor, header.trans_words * sizeof(bnfa_state_t));
+
+    bnfa->bnfaMatchList = match_list;
+    bnfa->bnfaTransList = trans;
+    bnfa->bnfaNumStates = header.num_states;
+    bnfa->bnfaMatchStates = 0;
+
+    for ( unsigned state = 0; state < header.num_states; ++state )
+    {
+        if ( match_list[state] )
+            ++bnfa->bnfaMatchStates;
+    }
+
+    bnfa->bnfaFormat = BNFA_SPARSE;
+    bnfa->bnfaCaseMode = header.case_mode;
+    bnfa->bnfaFailState = nullptr;
+    bnfa->bnfaNextState = nullptr;
+    bnfa->bnfaTransTable = nullptr;
+    return true;
 }
 
 /*

@@ -112,13 +112,11 @@ public:
     void set_debug_print_rule_groups_uncompiled()
     { portlists_flags |= PL_DEBUG_PRINT_RULEGROUPS_UNCOMPILED; }
 
-#ifdef HAVE_HYPERSCAN
     void set_rule_db_dir(const char* s)
     { rule_db_dir = s; }
 
     const std::string& get_rule_db_dir() const
     { return rule_db_dir; }
-#endif
 
     bool set_search_method(const char*);
     const char* get_search_method() const;
@@ -146,6 +144,12 @@ public:
     bool deduplicate() const
     { return dedup; }
 
+    void set_share_mpse(bool enable)
+    { share = enable; }
+
+    bool share_mpse() const
+    { return share and dedup; }
+
 private:
     const snort::MpseApi* search_api = nullptr;
     const snort::MpseApi* offload_search_api = nullptr;
@@ -154,6 +158,7 @@ private:
     bool split_any_any = false;
     bool debug = false;
     bool dedup = true;
+    bool share = true;
 
     unsigned max_queue_events = 5;
     unsigned bleedover_port_limit = 1024;
@@ -164,9 +169,7 @@ private:
     int portlists_flags = 0;
     unsigned num_patterns_truncated = 0;  // due to max_pattern_len
 
-#ifdef HAVE_HYPERSCAN
     std::string rule_db_dir;
-#endif
 };
 
 #endif

@@ -49,6 +49,10 @@ std::vector <PatternMatchData*> get_fp_content(
 void queue_mpse(snort::Mpse*);
 unsigned compile_mpses(struct snort::SnortConfig*, bool parallel = false);
 
+// lifecycle of the in-memory cache of compiled pattern matchers
+void reset_mpse_cache();
+unsigned get_mpse_cache_hits();
+
 bool has_service_rule_opt(OptTreeNode*);
 void validate_services(struct snort::SnortConfig*, OptTreeNode*);
 

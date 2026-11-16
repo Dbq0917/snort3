@@ -31,6 +31,8 @@
 */
 
 #include <cstdint>
+#include <cstddef>
+#include <string>
 
 #include "search_common.h"
 
@@ -167,6 +169,19 @@ int bnfaAddPattern(
     bool nocase, bool negative, void* userdata);
 
 int bnfaCompile(snort::SnortConfig*, bnfa_struct_t*);
+
+// (re)build the runtime detection option trees from the registered patterns;
+// used after a compiled state machine has been restored from cache
+void bnfaBuildMatchTrees(snort::SnortConfig*, bnfa_struct_t*);
+
+// deterministic fingerprint of the pattern set (contents + flags + ordering)
+void bnfaGetHash(bnfa_struct_t*, std::string& hash);
+
+// persist / restore the compiled state machine.  user data pointers and
+// detection option trees are runtime only and are not part of the image;
+// callers must rebuild those after a successful load.
+int bnfaSerialize(const bnfa_struct_t*, uint8_t*& buf, size_t& len);
+bool bnfaDeserialize(bnfa_struct_t*, const uint8_t* buf, size_t len);
 
 unsigned _bnfa_search_csparse_nfa(
     bnfa_struct_t * pstruct, const uint8_t* t, int tlen, MpseMatch,

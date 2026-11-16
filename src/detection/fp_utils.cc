@@ -28,6 +28,7 @@
 #include <iomanip>
 #include <list>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -279,6 +280,7 @@ bool FpSelector::is_better_than(
 //--------------------------------------------------------------------------
 
 static unsigned mpse_loaded, mpse_dumped;
+static std::set<Mpse*> s_preloaded;
 
 static bool store(const std::string& s, const uint8_t* data, size_t len)
 {
@@ -319,7 +321,7 @@ static std::string make_db_name(
     for ( auto c : id )
         ss << (unsigned)(uint8_t)c;
 
-    ss << ".hsdb";
+    ss << ".mpdb";
 
     return ss.str();
 }
@@ -336,6 +338,9 @@ static bool db_dump(const std::string& path, const char* proto, const char* dir,
 
             std::string id;
             it->group.normal_mpse->get_hash(id);
+
+            if ( id.empty() )
+                continue;  // search engine does not support persistence
 
             std::string file = make_db_name(path, proto, dir, it->name, id, sect);
 
@@ -368,30 +373,37 @@ static bool db_load(const std::string& path, const char* proto, const char* dir,
     {
         for ( auto it : g->pm_list[sect] )
         {
-            if (it->group.normal_is_dup)
+            Mpse* mpse = it->group.normal_mpse;
+
+            if (it->group.normal_is_dup or !mpse)
                 continue;
 
             std::string id;
-            it->group.normal_mpse->get_hash(id);
+            mpse->get_hash(id);
+
+            if ( id.empty() )
+                continue;  // search engine does not support persistence
 
             std::string file = make_db_name(path, proto, dir, it->name, id, sect);
 
             uint8_t* db = nullptr;
             size_t len = 0;
 
+            // a missing or stale cache entry is not fatal: leave this engine
+            // queued so it gets compiled and a fresh image dumped on exit.
             if ( !fetch(file, db, len) )
             {
-                ParseWarning(WARN_RULES, "Failed to read %s", file.c_str());
-                delete[] db;
-                return false;
+                continue;
             }
-            else if ( !it->group.normal_mpse->deserialize(db, len) )
+
+            if ( !mpse->deserialize(db, len) )
             {
                 ParseWarning(WARN_RULES, "Failed to deserialize %s", file.c_str());
                 delete[] db;
-                return false;
+                continue;
             }
             delete[] db;
+            s_preloaded.insert(mpse);
             ++mpse_loaded;
         }
     }
@@ -683,6 +695,105 @@ bool is_flowbit_setter(const OptFpList* ofp)
 static std::list<Mpse*> s_tbd;
 static std::mutex s_mutex;
 
+// Compiled-state-machine cache shared across rule groups with identical fast
+// pattern sets.  Only the serialized engine image is shared; every Mpse keeps
+// its own patterns, user data and detection trees.  This avoids recompiling
+// duplicate pattern sets and keeps only one copy of each unique state machine.
+struct MpseCacheEntry
+{
+    std::vector<uint8_t> image;
+    unsigned refs = 0;
+};
+
+static std::unordered_map<std::string, MpseCacheEntry> s_mpse_cache;
+static unsigned s_mpse_cache_hits = 0;
+
+void reset_mpse_cache()
+{
+    std::lock_guard<std::mutex> lock(s_mutex);
+    s_mpse_cache.clear();
+    s_preloaded.clear();
+    s_mpse_cache_hits = 0;
+}
+
+unsigned get_mpse_cache_hits()
+{ return s_mpse_cache_hits; }
+
+// serialize an already compiled engine and publish the image under key.
+// s_mutex must be held by the caller.
+static bool cache_store_locked(const std::string& key, Mpse* mpse)
+{
+    uint8_t* image = nullptr;
+    size_t image_len = 0;
+
+    if ( mpse->serialize(image, image_len) != 1 or !image )
+        return false;
+
+    MpseCacheEntry entry;
+    entry.image.assign(image, image + image_len);
+    entry.refs = 1;
+    free(image);
+
+    s_mpse_cache.emplace(key, std::move(entry));
+    return true;
+}
+
+// restore a compiled state machine from a cached image, then build the
+// engine's own runtime detection trees.  The expensive FSM compilation is
+// skipped; only the per-group trees are constructed.
+static bool restore_from_cache(
+    SnortConfig* sc, Mpse* mpse, const std::vector<uint8_t>& image)
+{
+    if ( !mpse->deserialize(image.data(), image.size()) )
+        return false;
+
+    return mpse->prep_patterns(sc) == 0;
+}
+
+static bool share_compiled_mpse(SnortConfig* sc, Mpse* mpse)
+{
+    std::string key;
+    mpse->get_hash(key);
+
+    if ( key.empty() )
+        return false;
+
+    std::unique_lock<std::mutex> lock(s_mutex);
+    auto it = s_mpse_cache.find(key);
+
+    if ( it != s_mpse_cache.end() )
+    {
+        std::vector<uint8_t> image = it->second.image;
+        ++it->second.refs;
+        ++s_mpse_cache_hits;
+        lock.unlock();
+
+        return restore_from_cache(sc, mpse, image);
+    }
+
+    // release the lock while compiling - other engines can build in parallel
+    lock.unlock();
+    const int rc = mpse->prep_patterns(sc);
+    lock.lock();
+
+    if ( rc )
+        return false;
+
+    // another thread may have compiled the same pattern set in the meantime
+    it = s_mpse_cache.find(key);
+    if ( it != s_mpse_cache.end() )
+    {
+        std::vector<uint8_t> image = it->second.image;
+        ++it->second.refs;
+        ++s_mpse_cache_hits;
+        lock.unlock();
+
+        return restore_from_cache(sc, mpse, image);
+    }
+
+    return cache_store_locked(key, mpse);
+}
+
 static Mpse* get_mpse()
 {
     std::lock_guard<std::mutex> lock(s_mutex);
@@ -703,12 +814,39 @@ static void compile_mpse(SnortConfig* sc, unsigned id, unsigned* count)
 
     while ( Mpse* m = get_mpse() )
     {
-        if ( !m->prep_patterns(sc) )
+        if ( s_preloaded.count(m) )
+        {
+            // restored from the on-disk rule db; only rebuild runtime trees
+            if ( m->prep_patterns(sc) )
+                ++c;
+            else if ( sc->fast_pattern_config->share_mpse() )
+            {
+                std::string key;
+                m->get_hash(key);
+
+                if ( !key.empty() )
+                {
+                    std::lock_guard<std::mutex> lock(s_mutex);
+                    if ( !s_mpse_cache.count(key) )
+                        cache_store_locked(key, m);
+                }
+            }
+            continue;
+        }
+
+        bool ok;
+
+        if ( sc->fast_pattern_config->share_mpse() )
+            ok = share_compiled_mpse(sc, m);
+        else
+            ok = !m->prep_patterns(sc);
+
+        if ( !ok )
         {
             if ( sc->fast_pattern_config->get_debug_mode() )
                 m->print_info();
 
-            c++;
+            ++c;
         }
     }
     std::lock_guard<std::mutex> lock(s_mutex);

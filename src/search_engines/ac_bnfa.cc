@@ -30,6 +30,7 @@
 #include "config.h"
 #endif
 
+#include "bnfa_search.h"
 #include "framework/module.h"
 #include "framework/mpse.h"
 #include "main/snort_types.h"
@@ -91,6 +92,7 @@ class AcBnfaMpse : public Mpse
 {
 private:
     bnfa_struct_t* obj;
+    bool loaded = false;
 
 public:
     AcBnfaMpse(const MpseAgent* agent) : Mpse("ac_bnfa")
@@ -109,10 +111,32 @@ public:
     { return bnfaAddPattern(obj, P, m, desc.no_case, desc.negated, user); }
 
     int prep_patterns(SnortConfig* sc) override
-    { return bnfaCompile(sc, obj); }
+    {
+        // a serialized database loaded via deserialize() already contains the
+        // compiled state machine; only the runtime detection trees are missing.
+        if ( loaded )
+        {
+            loaded = false;
+            bnfaBuildMatchTrees(sc, obj);
+            return 0;
+        }
+        return bnfaCompile(sc, obj);
+    }
 
     int get_pattern_count() const override
     { return bnfaPatternCount(obj); }
+
+    int serialize(uint8_t*& buf, size_t& len) const override
+    { return bnfaSerialize(obj, buf, len); }
+
+    bool deserialize(const uint8_t* buf, size_t len) override
+    {
+        loaded = bnfaDeserialize(obj, buf, len);
+        return loaded;
+    }
+
+    void get_hash(std::string& hash) override
+    { bnfaGetHash(obj, hash); }
 
     int print_info() override
     {

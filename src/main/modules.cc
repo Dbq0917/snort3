@@ -209,10 +209,11 @@ static const Parameter search_engine_params[] =
       "detection offload is disabled (no-op): formerly the fast pattern offload algorithm" },
 #endif
 
-#ifdef HAVE_HYPERSCAN
     { "rule_db_dir", Parameter::PT_STRING, nullptr, nullptr,
       "directory for reading / writing rule group databases" },
-#endif
+
+    { "share_mpse", Parameter::PT_BOOL, nullptr, "true",
+      "share compiled pattern matchers across identical rule groups to save memory" },
 
     { "split_any_any", Parameter::PT_BOOL, nullptr, "true",
       "evaluate any-any rules separately to save memory" },
@@ -310,10 +311,11 @@ bool SearchEngineModule::set(const char*, Value& v, SnortConfig* sc)
     else if ( v.is("detect_raw_tcp") )
         fp->set_stream_insert(v.get_bool());
 
-#ifdef HAVE_HYPERSCAN
     else if ( v.is("rule_db_dir") )
         fp->set_rule_db_dir(v.get_string());
-#endif
+
+    else if ( v.is("share_mpse") )
+        fp->set_share_mpse(v.get_bool());
 
     else if ( v.is("search_method") )
     {
